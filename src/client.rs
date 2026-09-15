@@ -1,10 +1,12 @@
 //! Official Rust client for tonia Pass (async).
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_core::Stream;
 use serde_json::{json, Value};
 
 use crate::errors::{
@@ -12,10 +14,13 @@ use crate::errors::{
 };
 use crate::escape::assert_path_allowed;
 use crate::limits::{limits_from_headers, LimitInfo};
-use crate::stream::{feed_sse, raise_if_stream_carrier, SseEvent};
+#[cfg(feature = "realtime")]
+use crate::realtime::{connect_realtime, RealtimeConnect, RealtimeSession};
+use crate::stream::SseStream;
 use crate::transport::{
-    build_headers, encode_path_segment, headers_from_reqwest, join_url, AuthStyle,
-    DEFAULT_BASE_URL, DEFAULT_TIMEOUT, IMAGE_TIMEOUT, SDK_USER_AGENT,
+    build_headers, encode_path_segment, headers_from_reqwest, is_binary_audio_content_type,
+    join_url, AuthStyle, TranscriptionError, TranscriptionFile, DEFAULT_BASE_URL, DEFAULT_TIMEOUT,
+    IMAGE_TIMEOUT, SDK_USER_AGENT,
 };
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,8 @@ pub struct Tonia {
     pub responses: Responses,
     pub rerank: Rerank,
     pub interactions: Interactions,
+    #[cfg(feature = "realtime")]
+    pub realtime: Realtime,
 }
 
 #[derive(Debug, Default)]
@@ -177,6 +184,10 @@ impl Tonia {
             interactions: Interactions {
                 inner: Arc::clone(&inner),
             },
+            #[cfg(feature = "realtime")]
+            realtime: Realtime {
+                inner: Arc::clone(&inner),
+            },
             inner,
         }
     }
@@ -195,6 +206,11 @@ impl Tonia {
 
     pub fn last_limits(&self) -> Option<LimitInfo> {
         self.inner.last_limits.lock().expect("last_limits").clone()
+    }
+
+    #[doc(hidden)]
+    pub fn heavy_timeout(&self) -> Duration {
+        image_timeout(&self.inner)
     }
 
     pub async fn request(
@@ -217,24 +233,23 @@ impl Tonia {
         .await
     }
 
-    pub async fn stream(
+    pub fn stream(
         &self,
         method: &str,
         path: &str,
         body: Option<Value>,
         opts: RequestOptions,
-    ) -> Result<Vec<SseEvent>, ToniaError> {
+    ) -> Result<SseStream, ToniaError> {
         let path = assert_path_allowed(path)?;
-        stream_sse(
-            &self.inner,
-            method,
-            &path,
+        Ok(start_sse(
+            Arc::clone(&self.inner),
+            method.to_string(),
+            path,
             body,
             opts.auth,
             Some(opts.headers),
             opts.timeout,
-        )
-        .await
+        ))
     }
 }
 
@@ -281,6 +296,26 @@ fn wants_stream(body: &Value) -> bool {
     body.get("stream").and_then(Value::as_bool) == Some(true)
 }
 
+fn reject_unary_stream(body: &Value) -> Result<(), ToniaError> {
+    if wants_stream(body) {
+        Err(ToniaError::invalid_request(
+            "use .stream() when stream is true",
+            "use_stream_helper",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_response_value(bytes: &Bytes) -> Value {
+    if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
+    }
+}
+
 async fn send_json(
     inner: &Inner,
     method: &str,
@@ -290,14 +325,117 @@ async fn send_json(
     headers: Option<HashMap<String, String>>,
     timeout: Option<Duration>,
 ) -> Result<Value, ToniaError> {
+    let (status, header_pairs, _content_type, bytes) = send_raw(
+        inner,
+        method,
+        path,
+        JsonOrForm::Json(body),
+        auth,
+        headers,
+        timeout,
+        "application/json",
+    )
+    .await?;
+    finish_parsed(inner, status, header_pairs, &bytes)
+}
+
+async fn send_bytes(
+    inner: &Inner,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    auth: AuthStyle,
+    headers: Option<HashMap<String, String>>,
+    timeout: Option<Duration>,
+) -> Result<Bytes, ToniaError> {
+    let (status, header_pairs, content_type, bytes) = send_raw(
+        inner,
+        method,
+        path,
+        JsonOrForm::Json(body),
+        auth,
+        headers,
+        timeout,
+        "application/json",
+    )
+    .await?;
+    if is_binary_audio_content_type(&content_type) {
+        if !(200..300).contains(&status) {
+            let parsed = parse_response_value(&bytes);
+            raise_from_response_body(&parsed, status, &header_pairs)?;
+            return Err(error_from_http_fallback(status, Some(parsed), header_pairs));
+        }
+        *inner.last_limits.lock().expect("last_limits") = limits_from_headers(&header_pairs);
+        return Ok(bytes);
+    }
+    finish_parsed(inner, status, header_pairs, &bytes)?;
+    Ok(bytes)
+}
+
+async fn send_multipart(
+    inner: &Inner,
+    method: &str,
+    path: &str,
+    form: reqwest::multipart::Form,
+    auth: AuthStyle,
+    timeout: Option<Duration>,
+) -> Result<Value, ToniaError> {
+    let (status, header_pairs, _content_type, bytes) = send_raw(
+        inner,
+        method,
+        path,
+        JsonOrForm::Multipart(form),
+        auth,
+        None,
+        timeout,
+        "application/json",
+    )
+    .await?;
+    finish_parsed(inner, status, header_pairs, &bytes)
+}
+
+fn finish_parsed(
+    inner: &Inner,
+    status: u16,
+    header_pairs: Vec<(String, String)>,
+    bytes: &Bytes,
+) -> Result<Value, ToniaError> {
+    let parsed = parse_response_value(bytes);
+    raise_from_response_body(&parsed, status, &header_pairs)?;
+    if !(200..300).contains(&status) {
+        return Err(error_from_http_fallback(status, Some(parsed), header_pairs));
+    }
+    *inner.last_limits.lock().expect("last_limits") = limits_from_headers(&header_pairs);
+    Ok(parsed)
+}
+
+enum JsonOrForm {
+    Json(Option<Value>),
+    Multipart(reqwest::multipart::Form),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_raw(
+    inner: &Inner,
+    method: &str,
+    path: &str,
+    body: JsonOrForm,
+    auth: AuthStyle,
+    headers: Option<HashMap<String, String>>,
+    timeout: Option<Duration>,
+    accept: &str,
+) -> Result<(u16, Vec<(String, String)>, String, Bytes), ToniaError> {
     let path = assert_path_allowed(path)?;
-    let hdrs = build_headers(
+    let mut hdrs = build_headers(
         inner.api_key.as_deref(),
         &inner.default_headers,
         auth,
         headers.as_ref(),
-        "application/json",
+        accept,
     )?;
+    if matches!(body, JsonOrForm::Multipart(_)) {
+        hdrs.retain(|key, _| !key.eq_ignore_ascii_case("content-type"));
+    }
     let url = join_url(&inner.base_url, &path);
     let mut req = inner.http.request(
         method
@@ -308,67 +446,14 @@ async fn send_json(
     for (key, value) in hdrs {
         req = req.header(key, value);
     }
-    if let Some(body) = body {
-        req = req.json(&body);
-    }
-    if let Some(timeout) = timeout {
-        req = req.timeout(timeout);
-    }
-    let res = req.send().await.map_err(ToniaError::transport)?;
-    let status = res.status().as_u16();
-    let header_pairs = headers_from_reqwest(res.headers());
-    let bytes = res.bytes().await.map_err(ToniaError::transport)?;
-    let parsed = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
-    };
-    raise_from_response_body(&parsed, status, &header_pairs)?;
-    if !(200..300).contains(&status) {
-        return Err(error_from_http_fallback(status, Some(parsed), header_pairs));
-    }
-    *inner.last_limits.lock().expect("last_limits") = limits_from_headers(&header_pairs);
-    Ok(parsed)
-}
-
-async fn stream_sse(
-    inner: &Inner,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-    auth: AuthStyle,
-    headers: Option<HashMap<String, String>>,
-    timeout: Option<Duration>,
-) -> Result<Vec<SseEvent>, ToniaError> {
-    let path = assert_path_allowed(path)?;
-    let payload = match body {
-        Some(Value::Object(mut map)) => {
-            map.insert("stream".to_string(), json!(true));
-            Value::Object(map)
+    match body {
+        JsonOrForm::Json(Some(body)) => {
+            req = req.json(&body);
         }
-        None => json!({ "stream": true }),
-        Some(other) => other,
-    };
-    let hdrs = build_headers(
-        inner.api_key.as_deref(),
-        &inner.default_headers,
-        auth,
-        headers.as_ref(),
-        "text/event-stream",
-    )?;
-    let url = join_url(&inner.base_url, &path);
-    let mut req = inner.http.request(
-        method
-            .parse::<reqwest::Method>()
-            .unwrap_or(reqwest::Method::POST),
-        &url,
-    );
-    for (key, value) in hdrs {
-        req = req.header(key, value);
-    }
-    if payload.is_object() {
-        req = req.json(&payload);
+        JsonOrForm::Json(None) => {}
+        JsonOrForm::Multipart(form) => {
+            req = req.multipart(form);
+        }
     }
     if let Some(timeout) = timeout {
         req = req.timeout(timeout);
@@ -382,47 +467,76 @@ async fn stream_sse(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    *inner.last_limits.lock().expect("last_limits") = limits_from_headers(&header_pairs);
-    if !(200..300).contains(&status) || !content_type.contains("text/event-stream") {
-        let bytes = res.bytes().await.map_err(ToniaError::transport)?;
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+    let bytes = res.bytes().await.map_err(ToniaError::transport)?;
+    Ok((status, header_pairs, content_type, bytes))
+}
+
+fn start_sse(
+    inner: Arc<Inner>,
+    method: String,
+    path: String,
+    body: Option<Value>,
+    auth: AuthStyle,
+    headers: Option<HashMap<String, String>>,
+    timeout: Option<Duration>,
+) -> SseStream {
+    SseStream::connecting(async move {
+        let path = assert_path_allowed(&path)?;
+        let payload = match body {
+            Some(Value::Object(mut map)) => {
+                map.insert("stream".to_string(), json!(true));
+                Value::Object(map)
+            }
+            None => json!({ "stream": true }),
+            Some(other) => other,
         };
-        raise_from_response_body(&parsed, status, &header_pairs)?;
-        if !(200..300).contains(&status) {
-            return Err(error_from_http_fallback(status, Some(parsed), header_pairs));
+        let hdrs = build_headers(
+            inner.api_key.as_deref(),
+            &inner.default_headers,
+            auth,
+            headers.as_ref(),
+            "text/event-stream",
+        )?;
+        let url = join_url(&inner.base_url, &path);
+        let mut req = inner.http.request(
+            method
+                .parse::<reqwest::Method>()
+                .unwrap_or(reqwest::Method::POST),
+            &url,
+        );
+        for (key, value) in hdrs {
+            req = req.header(key, value);
         }
-        return Ok(Vec::new());
-    }
-    raise_from_stream_headers(&header_pairs)?;
-    let mut buffer = String::new();
-    let mut events = Vec::new();
-    let mut byte_stream = res.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk.map_err(ToniaError::transport)?;
-        let text = String::from_utf8_lossy(&chunk);
-        let (parsed_events, rest) = feed_sse(&buffer, &text);
-        buffer = rest;
-        for event in parsed_events {
-            if let Some(json) = &event.json {
-                raise_if_stream_carrier(json)?;
+        if payload.is_object() {
+            req = req.json(&payload);
+        }
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
+        let res = req.send().await.map_err(ToniaError::transport)?;
+        let status = res.status().as_u16();
+        let header_pairs = headers_from_reqwest(res.headers());
+        let content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        *inner.last_limits.lock().expect("last_limits") = limits_from_headers(&header_pairs);
+        if !(200..300).contains(&status) || !content_type.contains("text/event-stream") {
+            let bytes = res.bytes().await.map_err(ToniaError::transport)?;
+            let parsed = parse_response_value(&bytes);
+            raise_from_response_body(&parsed, status, &header_pairs)?;
+            if !(200..300).contains(&status) {
+                return Err(error_from_http_fallback(status, Some(parsed), header_pairs));
             }
-            events.push(event);
+            return Ok(None);
         }
-    }
-    if !buffer.trim().is_empty() {
-        let (parsed_events, _) = feed_sse(&buffer, "\n\n");
-        for event in parsed_events {
-            if let Some(json) = &event.json {
-                raise_if_stream_carrier(json)?;
-            }
-            events.push(event);
-        }
-    }
-    Ok(events)
+        raise_from_stream_headers(&header_pairs)?;
+        let chunks: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin>> =
+            Box::pin(res.bytes_stream());
+        Ok(Some(chunks))
+    })
 }
 
 macro_rules! resource {
@@ -448,6 +562,8 @@ resource!(AudioTranscriptions);
 resource!(Responses);
 resource!(Rerank);
 resource!(Interactions);
+#[cfg(feature = "realtime")]
+resource!(Realtime);
 
 #[derive(Clone)]
 pub struct Chat {
@@ -563,10 +679,7 @@ impl Models {
 
 impl ChatCompletions {
     pub async fn create(&self, body: Value) -> Result<Value, ToniaError> {
-        if wants_stream(&body) {
-            let _ = self.stream(body).await?;
-            return Ok(Value::Null);
-        }
+        reject_unary_stream(&body)?;
         send_json(
             &self.inner,
             "POST",
@@ -579,26 +692,22 @@ impl ChatCompletions {
         .await
     }
 
-    pub async fn stream(&self, body: Value) -> Result<Vec<SseEvent>, ToniaError> {
-        stream_sse(
-            &self.inner,
-            "POST",
-            "/v1/chat/completions",
+    pub fn stream(&self, body: Value) -> SseStream {
+        start_sse(
+            Arc::clone(&self.inner),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
             Some(body),
             AuthStyle::Bearer,
             None,
             None,
         )
-        .await
     }
 }
 
 impl Messages {
     pub async fn create(&self, body: Value) -> Result<Value, ToniaError> {
-        if wants_stream(&body) {
-            let _ = self.stream(body).await?;
-            return Ok(Value::Null);
-        }
+        reject_unary_stream(&body)?;
         send_json(
             &self.inner,
             "POST",
@@ -611,17 +720,16 @@ impl Messages {
         .await
     }
 
-    pub async fn stream(&self, body: Value) -> Result<Vec<SseEvent>, ToniaError> {
-        stream_sse(
-            &self.inner,
-            "POST",
-            "/v1/messages",
+    pub fn stream(&self, body: Value) -> SseStream {
+        start_sse(
+            Arc::clone(&self.inner),
+            "POST".to_string(),
+            "/v1/messages".to_string(),
             Some(body),
             AuthStyle::ApiKey,
             None,
             None,
         )
-        .await
     }
 }
 
@@ -669,13 +777,13 @@ impl Images {
 }
 
 impl AudioSpeech {
-    pub async fn create(&self, body: Value) -> Result<bytes::Bytes, ToniaError> {
+    pub async fn create(&self, body: Value) -> Result<Bytes, ToniaError> {
         let mut headers = HashMap::new();
         headers.insert(
             "Accept".to_string(),
             "application/octet-stream, audio/*, application/json".to_string(),
         );
-        let value = send_json(
+        send_bytes(
             &self.inner,
             "POST",
             "/v1/audio/speech",
@@ -684,35 +792,44 @@ impl AudioSpeech {
             Some(headers),
             Some(image_timeout(&self.inner)),
         )
-        .await?;
-        match value {
-            Value::String(text) => Ok(bytes::Bytes::from(text)),
-            other => Ok(bytes::Bytes::from(other.to_string())),
-        }
+        .await
     }
 }
 
 impl AudioTranscriptions {
-    pub async fn create(&self, body: Value) -> Result<Value, ToniaError> {
-        send_json(
+    pub async fn create(
+        &self,
+        model: &str,
+        file: impl Into<TranscriptionFile>,
+        filename: Option<&str>,
+        extra_fields: &[(&str, &str)],
+    ) -> Result<Value, TranscriptionError> {
+        let file = file.into();
+        let (name, content, mime) = file.read(filename)?;
+        let mut form = reqwest::multipart::Form::new().text("model", model.to_string());
+        for (key, value) in extra_fields {
+            form = form.text((*key).to_string(), (*value).to_string());
+        }
+        let part = reqwest::multipart::Part::bytes(content.to_vec())
+            .file_name(name)
+            .mime_str(mime)
+            .expect("locked audio mime");
+        form = form.part("file", part);
+        Ok(send_multipart(
             &self.inner,
             "POST",
             "/v1/audio/transcriptions",
-            Some(body),
+            form,
             AuthStyle::Bearer,
-            None,
             Some(image_timeout(&self.inner)),
         )
-        .await
+        .await?)
     }
 }
 
 impl Responses {
     pub async fn create(&self, body: Value) -> Result<Value, ToniaError> {
-        if wants_stream(&body) {
-            let _ = self.stream(body).await?;
-            return Ok(Value::Null);
-        }
+        reject_unary_stream(&body)?;
         send_json(
             &self.inner,
             "POST",
@@ -725,17 +842,16 @@ impl Responses {
         .await
     }
 
-    pub async fn stream(&self, body: Value) -> Result<Vec<SseEvent>, ToniaError> {
-        stream_sse(
-            &self.inner,
-            "POST",
-            "/v1/responses",
+    pub fn stream(&self, body: Value) -> SseStream {
+        start_sse(
+            Arc::clone(&self.inner),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
             Some(body),
             AuthStyle::Bearer,
             None,
             None,
         )
-        .await
     }
 }
 
@@ -756,10 +872,7 @@ impl Rerank {
 
 impl Interactions {
     pub async fn create(&self, body: Value) -> Result<Value, ToniaError> {
-        if wants_stream(&body) {
-            let _ = self.stream(body).await?;
-            return Ok(Value::Null);
-        }
+        reject_unary_stream(&body)?;
         send_json(
             &self.inner,
             "POST",
@@ -772,15 +885,29 @@ impl Interactions {
         .await
     }
 
-    pub async fn stream(&self, body: Value) -> Result<Vec<SseEvent>, ToniaError> {
-        stream_sse(
-            &self.inner,
-            "POST",
-            "/v1/interactions",
+    pub fn stream(&self, body: Value) -> SseStream {
+        start_sse(
+            Arc::clone(&self.inner),
+            "POST".to_string(),
+            "/v1/interactions".to_string(),
             Some(body),
             AuthStyle::Bearer,
             None,
             Some(image_timeout(&self.inner)),
+        )
+    }
+}
+
+#[cfg(feature = "realtime")]
+impl Realtime {
+    pub async fn connect(&self, opts: RealtimeConnect) -> Result<RealtimeSession, ToniaError> {
+        let timeout = self.inner.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        connect_realtime(
+            self.inner.api_key.as_deref(),
+            &self.inner.base_url,
+            self.inner.realtime_url.as_deref(),
+            timeout,
+            opts,
         )
         .await
     }

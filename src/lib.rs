@@ -18,13 +18,18 @@ pub use errors::{
 };
 pub use escape::{assert_path_allowed, normalize_path, ESCAPE_HATCH_PREFIXES};
 pub use limits::{limits_from_headers, LimitInfo};
+#[cfg(feature = "realtime")]
+pub use realtime::{connect_realtime, RealtimeSession};
 pub use realtime::{
-    realtime_connect_url, realtime_ws_url, RealtimeConnectParams, FIRST_HOP_MODEL,
-    FIRST_HOP_PROVIDER, REALTIME_PATH, TERMINAL_TURN_TYPES, TURN_TYPES,
+    raise_if_realtime_error, realtime_connect_url, realtime_ws_url, RealtimeConnect,
+    RealtimeConnectParams, FIRST_HOP_MODEL, FIRST_HOP_PROVIDER, REALTIME_PATH, TERMINAL_TURN_TYPES,
+    TURN_TYPES,
 };
-pub use stream::{feed_sse, raise_if_stream_carrier, SseEvent};
+pub use stream::{feed_sse, raise_if_stream_carrier, SseEvent, SseStream};
 pub use transport::{
-    AuthStyle, DEFAULT_BASE_URL, DEFAULT_TIMEOUT, IMAGE_TIMEOUT, SDK_USER_AGENT, SDK_VERSION,
+    audio_mime_for_name, encode_path_segment, reject_data_uri, AuthStyle, InvalidTranscriptionFile,
+    TranscriptionError, TranscriptionFile, DEFAULT_BASE_URL, DEFAULT_TIMEOUT, IMAGE_TIMEOUT,
+    SDK_USER_AGENT, SDK_VERSION,
 };
 
 pub const VERSION: &str = SDK_VERSION;

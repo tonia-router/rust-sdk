@@ -45,6 +45,8 @@ fn unsupported_paths_rejected_before_send() {
         "/healthz",
         "/v1/models/../billing/checkout",
         "/v1/realtime",
+        "/admin",
+        "/v1/admin",
     ] {
         let err = assert_path_allowed(path).unwrap_err();
         assert_eq!(err.kind, ErrorKind::PathNotAllowed);

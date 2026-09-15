@@ -337,3 +337,20 @@ fn bare_400_fallback_stays_non_retryable() {
     assert_eq!(error.kind, ErrorKind::Tonia);
     assert_eq!(error.retryable, Some(false));
 }
+
+#[test]
+fn bare_502_fallback_is_retryable_api_error() {
+    let error = error_from_http_fallback(502, None, Vec::new());
+    assert_eq!(error.kind, ErrorKind::Api);
+    assert_eq!(error.retryable, Some(true));
+}
+
+#[test]
+fn string_error_envelope_leaves_retryable_none() {
+    let err =
+        raise_from_response_body(&json!({ "error": "upstream_said_no" }), 400, &[]).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Tonia);
+    assert_eq!(err.r#type, "invalid_request_error");
+    assert_eq!(err.retryable, None);
+    assert_eq!(err.message, "upstream_said_no");
+}

@@ -19,6 +19,15 @@ fn feed_sse_yields_done() {
 }
 
 #[test]
+fn feed_sse_splits_crlf_frames() {
+    let (events, rest) = feed_sse("", "data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\n");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].json, Some(json!({ "a": 1 })));
+    assert_eq!(events[1].json, Some(json!({ "b": 2 })));
+    assert_eq!(rest, "");
+}
+
+#[test]
 fn stream_carrier_nested_anthropic_message_start() {
     let err = raise_if_stream_carrier(&json!({
         "type": "message_start",
