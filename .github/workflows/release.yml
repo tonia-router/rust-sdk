@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo package --allow-dirty
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cat > /tmp/notes.md <<EOF
+          Official Rust client for tonia Pass (\`tonia-sdk\` ${TAG}).
+
+          Path / git install until crates.io:
+
+          \`\`\`toml
+          tonia-sdk = { git = "https://github.com/tonia-router/rust-sdk", tag = "${TAG}" }
+          \`\`\`
+
+          Requires Rust 1.85+. Apache 2.0, copyright 2026 tonia inc.
+          Do not \`cargo add tonia-sdk\` from crates.io until a trusted
+          publish exists.
+          EOF
+          CRATE=$(ls target/package/tonia-sdk-*.crate)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$CRATE" --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md "$CRATE"
+          fi
