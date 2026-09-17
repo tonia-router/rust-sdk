@@ -31,6 +31,8 @@ jobs:
           cat > /tmp/notes.md <<EOF
           Official Rust client for tonia Pass (\`tonia-sdk\` ${TAG}).
 
+          Stream cancel: \`stream.abort()\`, or drop the \`SseStream\`.
+
           Path / git install until crates.io:
 
           \`\`\`toml

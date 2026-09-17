@@ -2,12 +2,12 @@
 
 Official Rust client for [tonia Pass](https://pass.tonia.ca).
 
-**Crate:** `tonia-sdk` **0.4.1** — GitHub `main` / tag `v0.4.1`. Not on
+**Crate:** `tonia-sdk` **0.4.2** — GitHub `main` / tag `v0.4.2`. Not on
 crates.io yet. Do not `cargo add tonia-sdk` from the registry.
 **API contract:** [`tonia-api`](https://github.com/tonia-router/tonia-api)
 
 ```toml
-tonia-sdk = { git = "https://github.com/tonia-router/rust-sdk", tag = "v0.4.1" }
+tonia-sdk = { git = "https://github.com/tonia-router/rust-sdk", tag = "v0.4.2" }
 # local Tonia tree:
 # tonia-sdk = { path = "../tonia-router/rust-sdk" }
 ```
@@ -50,6 +50,7 @@ async fn main() -> Result<(), tonia_sdk::ToniaError> {
     }));
     while let Some(event) = stream.next().await {
         let _event = event?;
+        // Hang up: stream.abort(), or drop the stream.
     }
     Ok(())
 }
@@ -60,7 +61,7 @@ async fn main() -> Result<(), tonia_sdk::ToniaError> {
 Live is `client.realtime.connect`. Speech returns raw bytes; STT is multipart
 (`TranscriptionFile`, no `data:` URI).
 
-User-Agent is `tonia-sdk-rs/0.4.1`. The crate reads `TONIA_API_KEY` and
+User-Agent is `tonia-sdk-rs/0.4.2`. The crate reads `TONIA_API_KEY` and
 `TONIA_REALTIME_URL` only. It does not read `TONIA_BASE_URL`. It does not
 auto-retry — follow `retryable` and `retry_after_seconds` on
 [`ToniaError`](src/errors.rs).

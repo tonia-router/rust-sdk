@@ -124,6 +124,11 @@ impl SseStream {
             state: SseStreamState::Connecting(Box::pin(future)),
         }
     }
+
+    /// Hang up the Pass socket. Same as dropping the stream.
+    pub fn abort(&mut self) {
+        self.state = SseStreamState::Done;
+    }
 }
 
 impl Stream for SseStream {
@@ -195,5 +200,18 @@ impl Stream for SseStream {
                 SseStreamState::Failed | SseStreamState::Done => return Poll::Ready(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn abort_ends_stream() {
+        let mut stream = SseStream::connecting(async { Ok(None) });
+        stream.abort();
+        assert!(stream.next().await.is_none());
     }
 }
