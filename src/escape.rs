@@ -14,6 +14,7 @@ pub const ESCAPE_HATCH_PREFIXES: &[&str] = &[
     "/v1/responses",
     "/v1/rerank",
     "/v1/interactions",
+    "/v1/systemone",
 ];
 
 pub fn normalize_path(path: &str) -> String {

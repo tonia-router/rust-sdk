@@ -23,6 +23,7 @@ fn supported_prefixes_pass() {
         "/v1/interactions",
         "/v1/audio/speech",
         "/v1/audio/transcriptions",
+        "/v1/systemone",
     ] {
         assert_eq!(assert_path_allowed(path).unwrap(), path);
     }

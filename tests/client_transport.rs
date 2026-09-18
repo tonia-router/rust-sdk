@@ -466,6 +466,31 @@ async fn named_helpers_hit_locked_paths() {
 }
 
 #[tokio::test]
+async fn systemone_stays_an_escape_hatch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "answers": {} })))
+        .mount(&server)
+        .await;
+
+    let body = client(&server, Some("tonia_test"))
+        .request(
+            "POST",
+            "/v1/systemone",
+            Some(json!({
+                "model": "typesafe/jev-latest",
+                "state": "The sky is blue.",
+                "questions": { "color": { "type": "noul", "instructions": "Is the sky blue?" } }
+            })),
+            RequestOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body["answers"], json!({}));
+}
+
+#[tokio::test]
 async fn gemini_interactions_body_is_passthrough() {
     let server = MockServer::start().await;
     let body = json!({
