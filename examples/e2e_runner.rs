@@ -45,7 +45,10 @@ async fn run() -> Vec<Value> {
         &mut results,
         "sdk_rust_public_models",
         "/v1/public/models",
-        object_ok(public.public_models.list().await, "public_models_body_missing"),
+        object_ok(
+            public.public_models.list().await,
+            "public_models_body_missing",
+        ),
     );
     push_cell(
         &mut results,

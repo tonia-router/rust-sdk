@@ -90,7 +90,8 @@ fn transport_rtc_is_forbidden() {
 
 #[test]
 fn connect_url_defaults_native_with_transcripts() {
-    let url = realtime_connect_url(RealtimeConnectParams::new("https://pass.tonia.ca:8443")).unwrap();
+    let url =
+        realtime_connect_url(RealtimeConnectParams::new("https://pass.tonia.ca:8443")).unwrap();
     assert!(url.contains("mode=native"));
     assert!(url.contains("transcripts=1"));
 }
@@ -102,7 +103,10 @@ fn native_with_transcripts_off_is_rejected() {
         ..RealtimeConnectParams::new("https://pass.tonia.ca:8443")
     })
     .unwrap_err();
-    assert_eq!(err.code.as_deref(), Some("realtime_native_transcripts_required"));
+    assert_eq!(
+        err.code.as_deref(),
+        Some("realtime_native_transcripts_required")
+    );
 }
 
 #[test]
