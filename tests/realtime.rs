@@ -89,16 +89,20 @@ fn transport_rtc_is_forbidden() {
 }
 
 #[test]
-fn native_without_transcripts_is_invalid() {
+fn connect_url_defaults_native_with_transcripts() {
+    let url = realtime_connect_url(RealtimeConnectParams::new("https://pass.tonia.ca:8443")).unwrap();
+    assert!(url.contains("mode=native"));
+    assert!(url.contains("transcripts=1"));
+}
+
+#[test]
+fn native_with_transcripts_off_is_rejected() {
     let err = realtime_connect_url(RealtimeConnectParams {
-        mode: "native",
+        transcripts: false,
         ..RealtimeConnectParams::new("https://pass.tonia.ca:8443")
     })
     .unwrap_err();
-    assert_eq!(
-        err.code.as_deref(),
-        Some("realtime_native_transcripts_required")
-    );
+    assert_eq!(err.code.as_deref(), Some("realtime_native_transcripts_required"));
 }
 
 #[test]
@@ -106,6 +110,7 @@ fn connect_url_includes_query() {
     let url = realtime_connect_url(RealtimeConnectParams {
         provider: FIRST_HOP_PROVIDER,
         model: FIRST_HOP_MODEL,
+        mode: "cascaded",
         chat_model: Some("gpt-5.4"),
         transcripts: true,
         ..RealtimeConnectParams::new("https://pass.tonia.ca:8443")

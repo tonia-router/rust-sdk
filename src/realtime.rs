@@ -86,9 +86,9 @@ impl<'a> RealtimeConnectParams<'a> {
             realtime_url: None,
             provider: FIRST_HOP_PROVIDER,
             model: FIRST_HOP_MODEL,
-            mode: "cascaded",
+            mode: "native",
             chat_model: None,
-            transcripts: false,
+            transcripts: true,
             webrtc: false,
             transport: None,
         }
@@ -114,7 +114,7 @@ pub fn realtime_connect_url(params: RealtimeConnectParams<'_>) -> Result<String,
         ));
     }
     let mode_norm = if params.mode.trim().is_empty() {
-        "cascaded".to_string()
+        "native".to_string()
     } else {
         params.mode.trim().to_ascii_lowercase()
     };
@@ -450,7 +450,9 @@ mod live {
             .ok_or_else(ToniaError::missing_bearer)?;
         let provider = opts.provider.as_deref().unwrap_or(FIRST_HOP_PROVIDER);
         let model = opts.model.as_deref().unwrap_or(FIRST_HOP_MODEL);
-        let mode = opts.mode.as_deref().unwrap_or("cascaded");
+        let mode = opts.mode.as_deref().unwrap_or("native");
+        // Native is the default and always needs transcripts.
+        let transcripts = opts.transcripts || mode.trim().eq_ignore_ascii_case("native");
         let url = super::realtime_connect_url(RealtimeConnectParams {
             base_url,
             realtime_url,
@@ -458,7 +460,7 @@ mod live {
             model,
             mode,
             chat_model: opts.chat_model.as_deref(),
-            transcripts: opts.transcripts,
+            transcripts,
             webrtc: false,
             transport: None,
         })?;
